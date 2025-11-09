@@ -5,8 +5,11 @@ Ein Python-Skript für macOS, das automatisch:
 2. IP-Adresse und Subnetzmaske abruft
 3. ARP-Scan mit arp-scan durchführt (Duplikate entfernt)
 4. Nmap-Scan auf gefundene Hosts ausführt (OS-Erkennung + offene Ports) und XML-Ausgabe in Datei speichert
-5. Ergebnisse in CSV-Datei (`netzwerk_uebersicht.csv`) exportiert
+5. Ergebnisse in CSV-Datei (`netzwerk_uebersicht.csv`) exportiert, ohne alte Details zu überschreiben
+   und mit Spalten 'Last Seen' (Datum + Uhrzeit) und 'Eigene Details' ergänzt.
 
+
+   
 Voraussetzungen:
 - arp-scan (`brew install arp-scan`)
 - nmap (`brew install nmap`)
@@ -19,6 +22,7 @@ import xml.etree.ElementTree as ET
 import csv
 import sys
 import os
+import datetime
 
 
 def get_default_interface():
@@ -58,7 +62,6 @@ def arp_scan(iface, network):
 def nmap_scan(hosts, xml_file='nmap_results.xml'):
     ips = sorted({h['ip'] for h in hosts})
     print(f"Starte Nmap-Scan auf {len(ips)} Hosts... (Ausgabe: {xml_file})")
-    # Ausgabe direkt in Datei
     nm_cmd = ['nmap', '-O', '-sV', '-oX', xml_file] + ips
     result = subprocess.run(nm_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -79,7 +82,8 @@ def parse_nmap_xml(xml_data):
     info = {}
     for host in root.findall('host'):
         addr4 = host.find("address[@addrtype='ipv4']")
-        if addr4 is None: continue
+        if addr4 is None: 
+            continue
         ip = addr4.get('addr')
         mac_elem = host.find("address[@addrtype='mac']")
         mac = mac_elem.get('addr') if mac_elem is not None else ''
@@ -113,12 +117,38 @@ def merge_results(arp_hosts, nmap_info):
     return merged
 
 
+def read_existing_csv(filename):
+    if not os.path.exists(filename):
+        return {}
+    data = {}
+    with open(filename, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ip = row['IP']
+            data[ip] = row
+    return data
+
+
 def write_csv(entries, filename='netzwerk_uebersicht.csv'):
+    existing_data = read_existing_csv(filename)
+    now = datetime.datetime.now().isoformat(timespec='seconds')  # z.B. 2025-11-09T17:40:12
     print(f"Schreibe Ergebnisse in {filename}...")
     with open(filename, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=['IP','MAC','Gerätetyp/OS','Offene Ports'])
+        fieldnames = ['IP', 'MAC', 'Eigene Details', 'Last Seen', 'Gerätetyp/OS', 'Offene Ports']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(entries)
+        for entry in entries:
+            ip = entry['IP']
+            old_row = existing_data.get(ip, {})
+            row = {
+                'IP': ip,
+                'MAC': entry.get('MAC', ''),
+                'Eigene Details': old_row.get('Eigene Details', ''),
+                'Last Seen': now,
+                'Gerätetyp/OS': entry.get('Gerätetyp/OS', ''),
+                'Offene Ports': entry.get('Offene Ports', '')
+            }
+            writer.writerow(row)
 
 
 def main():
@@ -141,6 +171,6 @@ def main():
     write_csv(merged)
     print("Fertig. Datei 'netzwerk_uebersicht.csv' erstellt.")
 
+
 if __name__ == '__main__':
     main()
-
