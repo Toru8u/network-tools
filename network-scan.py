@@ -5,11 +5,9 @@ Ein Python-Skript für macOS, das automatisch:
 2. IP-Adresse und Subnetzmaske abruft
 3. ARP-Scan mit arp-scan durchführt (Duplikate entfernt)
 4. Nmap-Scan auf gefundene Hosts ausführt (OS-Erkennung + offene Ports) und XML-Ausgabe in Datei speichert
-5. Ergebnisse in CSV-Datei (`netzwerk_uebersicht.csv`) exportiert, ohne alte Details zu überschreiben
-   und mit Spalten 'Last Seen' (Datum + Uhrzeit) und 'Eigene Details' ergänzt.
+5. Ergebnisse in CSV-Datei (`netzwerk_uebersicht.csv`) exportiert – alte und nicht mehr gefundene Geräte bleiben enthalten,
+   nur `Last Seen` wird NICHT aktualisiert, wenn ein Host nicht erneut gefunden wird.
 
-
-   
 Voraussetzungen:
 - arp-scan (`brew install arp-scan`)
 - nmap (`brew install nmap`)
@@ -24,7 +22,6 @@ import sys
 import os
 import datetime
 
-
 def get_default_interface():
     gateways = netifaces.gateways()
     default = gateways.get('default', {})
@@ -33,14 +30,12 @@ def get_default_interface():
         return iface[1]
     raise RuntimeError("Keine Standard-IPv4-Schnittstelle gefunden.")
 
-
 def get_ip_and_netmask(iface):
     addrs = netifaces.ifaddresses(iface)
     if netifaces.AF_INET not in addrs:
         raise RuntimeError(f"Schnittstelle {iface} hat keine IPv4-Adresse.")
     info = addrs[netifaces.AF_INET][0]
     return info['addr'], info['netmask']
-
 
 def arp_scan(iface, network):
     print(f"Starte ARP-Scan auf {network} via {iface}...")
@@ -58,11 +53,12 @@ def arp_scan(iface, network):
                 continue
     return [{'ip': ip, 'mac': mac} for ip, mac in hosts.items()]
 
-
 def nmap_scan(hosts, xml_file='nmap_results.xml'):
     ips = sorted({h['ip'] for h in hosts})
+    if not ips:
+        return ""
     print(f"Starte Nmap-Scan auf {len(ips)} Hosts... (Ausgabe: {xml_file})")
-    nm_cmd = ['nmap', '-O', '-sV', '-oX', xml_file] + ips
+    nm_cmd = ['nmap', '-sV', '-oX', xml_file] + ips  # '-O' ggf. entfernen für Kompatibilität
     result = subprocess.run(nm_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Warnung: Nmap lieferte Fehlerstatus {result.returncode}.")
@@ -72,8 +68,9 @@ def nmap_scan(hosts, xml_file='nmap_results.xml'):
     with open(xml_file, 'r') as f:
         return f.read()
 
-
 def parse_nmap_xml(xml_data):
+    if not xml_data:
+        return {}
     try:
         root = ET.fromstring(xml_data)
     except ET.ParseError as e:
@@ -82,7 +79,7 @@ def parse_nmap_xml(xml_data):
     info = {}
     for host in root.findall('host'):
         addr4 = host.find("address[@addrtype='ipv4']")
-        if addr4 is None: 
+        if addr4 is None:
             continue
         ip = addr4.get('addr')
         mac_elem = host.find("address[@addrtype='mac']")
@@ -100,7 +97,6 @@ def parse_nmap_xml(xml_data):
         info[ip] = {'mac_nmap': mac, 'os': os_name, 'ports': ports}
     return info
 
-
 def merge_results(arp_hosts, nmap_info):
     merged = []
     for h in arp_hosts:
@@ -116,7 +112,6 @@ def merge_results(arp_hosts, nmap_info):
         merged.append(entry)
     return merged
 
-
 def read_existing_csv(filename):
     if not os.path.exists(filename):
         return {}
@@ -128,28 +123,57 @@ def read_existing_csv(filename):
             data[ip] = row
     return data
 
-
 def write_csv(entries, filename='netzwerk_uebersicht.csv'):
     existing_data = read_existing_csv(filename)
-    now = datetime.datetime.now().isoformat(timespec='seconds')  # z.B. 2025-11-09T17:40:12
+    now = datetime.datetime.now().isoformat(timespec='seconds')
     print(f"Schreibe Ergebnisse in {filename}...")
-    with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['IP', 'MAC', 'Eigene Details', 'Last Seen', 'Gerätetyp/OS', 'Offene Ports']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for entry in entries:
-            ip = entry['IP']
-            old_row = existing_data.get(ip, {})
-            row = {
+    # 1. Alle bisherigen Einträge als Basis
+    all_ips = set(existing_data.keys())
+    new_ips = set(entry['IP'] for entry in entries)
+    all_combined = []
+    # 2. Zuerst alle alten Einträge, ggf. updaten
+    for ip, row in existing_data.items():
+        if ip in new_ips:
+            # Wurde erneut gefunden – Felder aktualisieren, Last Seen neu
+            updated = next(e for e in entries if e['IP'] == ip)
+            row_out = {
                 'IP': ip,
+                'MAC': updated.get('MAC', row.get('MAC', '')),
+                'Eigene Details': row.get('Eigene Details', ''),
+                'Last Seen': now,
+                'Gerätetyp/OS': updated.get('Gerätetyp/OS', ''),
+                'Offene Ports': updated.get('Offene Ports', '')
+            }
+        else:
+            # Nicht im aktuellen Scan → Alt-Daten so belassen, Last Seen bleibt alt!
+            row_out = {
+                'IP': ip,
+                'MAC': row.get('MAC', ''),
+                'Eigene Details': row.get('Eigene Details', ''),
+                'Last Seen': row.get('Last Seen', ''),
+                'Gerätetyp/OS': row.get('Gerätetyp/OS', ''),
+                'Offene Ports': row.get('Offene Ports', '')
+            }
+        all_combined.append(row_out)
+    # 3. Neue IPs (die es vorher noch nicht gab) ergänzen
+    for entry in entries:
+        if entry['IP'] not in all_ips:
+            row_out = {
+                'IP': entry['IP'],
                 'MAC': entry.get('MAC', ''),
-                'Eigene Details': old_row.get('Eigene Details', ''),
+                'Eigene Details': '',
                 'Last Seen': now,
                 'Gerätetyp/OS': entry.get('Gerätetyp/OS', ''),
                 'Offene Ports': entry.get('Offene Ports', '')
             }
+            all_combined.append(row_out)
+    # 4. Schreibe alles in die Datei
+    with open(filename, 'w', newline='') as csvfile:
+        fieldnames = ['IP', 'MAC', 'Eigene Details', 'Last Seen', 'Gerätetyp/OS', 'Offene Ports']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_combined:
             writer.writerow(row)
-
 
 def main():
     try:
@@ -158,19 +182,15 @@ def main():
     except Exception as e:
         print(f"Fehler: {e}")
         sys.exit(1)
-
     network = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
     arp_hosts = arp_scan(iface, network)
     if not arp_hosts:
-        print("Keine Hosts gefunden. Ende.")
-        sys.exit(0)
-
+        print("Keine Hosts gefunden. Keine Liste aktualisiert.")
     xml = nmap_scan(arp_hosts)
     nmap_info = parse_nmap_xml(xml)
     merged = merge_results(arp_hosts, nmap_info)
     write_csv(merged)
     print("Fertig. Datei 'netzwerk_uebersicht.csv' erstellt.")
-
 
 if __name__ == '__main__':
     main()
